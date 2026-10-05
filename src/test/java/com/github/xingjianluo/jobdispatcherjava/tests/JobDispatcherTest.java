@@ -182,7 +182,14 @@ class JobDispatcherTest {
         assertEquals(JobStatus.QUEUED, job.getStatus());
         logJob("reclaimed", job, "expired lease reclaimed, job re-queued instead of stuck forever");
 
-        // owner-B 重新获取；owner-A 的过期租约不得再生效（不重复执行）
+        // 回收后有退避窗口，不能刚回收就立刻被抢走空转
+        AcquireResult tooEarly = dispatcher.acquire("owner-B");
+        assertFalse(tooEarly.acquired());
+        log.info("[assert] checkpoint=reclaim-backoff jobId={} rationale={}",
+                job.getId(), "reclaimed job not acquirable until backoff elapses: " + tooEarly.reason());
+
+        // 退避到期后 owner-B 重新获取；owner-A 的过期租约不得再生效（不重复执行）
+        clock.advance(Duration.ofMillis(150));
         AcquireResult second = dispatcher.acquire("owner-B");
         assertTrue(second.acquired());
         assertThrows(JobConflictException.class,

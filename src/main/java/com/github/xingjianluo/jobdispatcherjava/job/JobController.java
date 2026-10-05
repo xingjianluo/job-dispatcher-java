@@ -79,8 +79,18 @@ public class JobController {
 
     @PostMapping("/{jobId}/cancel")
     public Map<String, Object> cancel(@PathVariable String jobId) {
-        boolean effective = dispatcher.cancel(jobId);
-        return Map.of("cancelled", effective, "jobId", jobId);
+        CancelResult result = dispatcher.cancelWithOutcome(jobId);
+        // 保留原有 cancelled 布尔字段，新增 outcome/reason 便于区分三种取消结果
+        return Map.of(
+                "cancelled", result.effective(),
+                "outcome", result.outcome().name(),
+                "reason", result.reason(),
+                "jobId", jobId);
+    }
+
+    @GetMapping("/{jobId}/history")
+    public List<Map<String, Object>> history(@PathVariable String jobId) {
+        return dispatcher.history(jobId).stream().map(JobController::toEventView).toList();
     }
 
     @PostMapping("/reap")
@@ -115,6 +125,19 @@ public class JobController {
         log.error("[unexpected] internal error", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(Map.of("error", "INTERNAL_ERROR", "reason", "internal error, see server logs"));
+    }
+
+    private static Map<String, Object> toEventView(JobEvent event) {
+        Map<String, Object> view = new java.util.LinkedHashMap<>();
+        view.put("sequence", event.sequence());
+        view.put("jobId", event.jobId());
+        view.put("at", event.at().toString());
+        view.put("fromStatus", event.fromStatus() == null ? "" : event.fromStatus().name());
+        view.put("toStatus", event.toStatus().name());
+        view.put("attempt", event.attempt());
+        view.put("actor", event.actor());
+        view.put("rationale", event.rationale());
+        return view;
     }
 
     private static Map<String, Object> toView(Job job) {
