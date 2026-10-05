@@ -79,8 +79,9 @@ public class JobController {
 
     @PostMapping("/{jobId}/cancel")
     public Map<String, Object> cancel(@PathVariable String jobId) {
-        boolean effective = dispatcher.cancel(jobId);
-        return Map.of("cancelled", effective, "jobId", jobId);
+        CancelResult result = dispatcher.cancelJob(jobId);
+        return Map.of("cancelled", result.effective(), "jobId", jobId,
+                "outcome", result.outcome().name(), "reason", result.reason());
     }
 
     @PostMapping("/reap")
@@ -94,6 +95,30 @@ public class JobController {
                 .<ResponseEntity<?>>map(job -> ResponseEntity.ok(toView(job)))
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND)
                         .body(Map.of("error", "job not found", "jobId", jobId)));
+    }
+
+    /** 查询一条作业从提交到结束的状态流转记录（按时间顺序，每条含判定依据）。 */
+    @GetMapping("/{jobId}/history")
+    public ResponseEntity<?> history(@PathVariable String jobId) {
+        if (dispatcher.find(jobId).isEmpty()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Map.of("error", "job not found", "jobId", jobId));
+        }
+        List<Map<String, Object>> entries = dispatcher.history(jobId).stream()
+                .map(JobController::toTransitionView)
+                .toList();
+        return ResponseEntity.ok(Map.of("jobId", jobId, "transitions", entries));
+    }
+
+    private static Map<String, Object> toTransitionView(JobTransition t) {
+        Map<String, Object> view = new java.util.LinkedHashMap<>();
+        view.put("sequence", t.sequence());
+        view.put("from", t.from() == null ? "" : t.from().name());
+        view.put("to", t.to().name());
+        view.put("version", t.version());
+        view.put("at", t.at().toString());
+        view.put("rationale", t.rationale());
+        return view;
     }
 
     @GetMapping

@@ -40,6 +40,10 @@ public class JobDispatcher {
     private final ReentrantLock lock = new ReentrantLock();
     private final Map<String, Job> jobs = new LinkedHashMap<>();
     private final Map<String, String> idempotencyIndex = new HashMap<>();
+    /** 每个作业的状态流转记录（仅在同一把锁内追加，保证不丢不重、顺序与状态一致） */
+    private final Map<String, List<JobTransition>> histories = new HashMap<>();
+    /** 全局流转序号，保证并发下记录的全序 */
+    private long transitionSequence = 0;
     /** 已到期可执行的排队作业：优先级降序，同优先级按创建时间升序 */
     private final PriorityQueue<Job> readyQueue = new PriorityQueue<>(
             Comparator.comparingInt(Job::getPriority).reversed()
@@ -78,6 +82,8 @@ public class JobDispatcher {
             jobs.put(job.getId(), job);
             idempotencyIndex.put(idempotencyKey, job.getId());
             readyQueue.add(job);
+            recordTransition(job, null, JobStatus.QUEUED,
+                    "submitted and enqueued priority=" + priority);
             SubmitResult result = SubmitResult.accepted(job);
             log.info("[submit] jobId={} key={} priority={} outcome={} reason={}",
                     job.getId(), idempotencyKey, priority, result.outcome(), result.reason());
@@ -126,6 +132,8 @@ public class JobDispatcher {
             Job job = requireLeasedBy(jobId, leaseId, owner, "renew");
             job.setLeaseExpiresAt(Instant.now(clock).plus(properties.getLeaseDuration()));
             bump(job);
+            recordTransition(job, JobStatus.LEASED, JobStatus.LEASED,
+                    "lease renewed by " + owner + " newExpiresAt=" + job.getLeaseExpiresAt());
             log.info("[renew] jobId={} owner={} newExpiresAt={}", jobId, owner, job.getLeaseExpiresAt());
             return true;
         } finally {
@@ -175,21 +183,40 @@ public class JobDispatcher {
     }
 
     /**
-     * 取消作业。
+     * 取消作业（旧签名，语义不变）。
      *
-     * @return true 本次取消生效；false 作业已处于终态（重复取消可判别）
+     * @return true 本次取消生效；false 作业已处于终态
      */
     public boolean cancel(String jobId) {
+        return cancelJob(jobId).effective();
+    }
+
+    /**
+     * 取消作业（三态判定）。
+     *
+     * <p>结果可区分为：本次生效（CANCELLED）、此前已取消过（ALREADY_CANCELLED）、
+     * 已因其它原因进入终态（ALREADY_TERMINAL）。后两种不产生任何状态变化，
+     * 原有状态与失败原因保持不变。</p>
+     */
+    public CancelResult cancelJob(String jobId) {
         lock.lock();
         try {
             Job job = jobs.get(jobId);
             if (job == null) {
                 throw new JobConflictException("cancel rejected: unknown jobId=" + jobId);
             }
+            if (job.getStatus() == JobStatus.CANCELLED) {
+                CancelResult result = new CancelResult(CancelOutcome.ALREADY_CANCELLED, job,
+                        "job already cancelled before, no state change");
+                log.info("[cancel] jobId={} outcome={} reason={}", jobId, result.outcome(), result.reason());
+                return result;
+            }
             if (isTerminal(job.getStatus())) {
-                log.info("[cancel] jobId={} effective=false reason=already terminal status={}",
-                        jobId, job.getStatus());
-                return false;
+                CancelResult result = new CancelResult(CancelOutcome.ALREADY_TERMINAL, job,
+                        "job already terminal status=" + job.getStatus()
+                                + " failureKind=" + job.getFailureKind() + ", no state change");
+                log.info("[cancel] jobId={} outcome={} reason={}", jobId, result.outcome(), result.reason());
+                return result;
             }
             if (job.getStatus() == JobStatus.QUEUED) {
                 readyQueue.remove(job);
@@ -197,16 +224,24 @@ public class JobDispatcher {
             clearLease(job);
             job.setFailureKind(FailureKind.CANCELLED);
             transition(job, JobStatus.CANCELLED, "cancelled");
-            return true;
+            CancelResult result = new CancelResult(CancelOutcome.CANCELLED, job, "cancel effective");
+            log.info("[cancel] jobId={} outcome={} reason={}", jobId, result.outcome(), result.reason());
+            return result;
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * 回收到期租约：执行方失联的租约到期后作业重新入队，不会永久卡住。
+     * 回收到期租约：执行方失联的租约到期后纳入同一套有界重试。
      *
-     * @return 被回收重新入队的作业数
+     * <p>每次回收消耗一次尝试机会（尝试次数在租约授予时已计入）：
+     * 未耗尽时按与失败重试相同的指数退避安排下一次可被抢占的时间，
+     * 不会刚回收就立刻被抢走空转；耗尽时进入终态 FAILED 且
+     * {@code failureKind=LOST}，与 RETRIES_EXHAUSTED / NON_RETRYABLE 可区分，
+     * 失联作业不会无限循环、不会永久卡死。</p>
+     *
+     * @return 被回收的租约数（含重新入队与转入终态）
      */
     public int reapExpiredLeases() {
         lock.lock();
@@ -219,15 +254,27 @@ public class JobDispatcher {
                         && !job.getLeaseExpiresAt().isAfter(now)) {
                     String lostOwner = job.getLeaseOwner();
                     clearLease(job);
-                    job.setNextAttemptAt(now);
-                    transition(job, JobStatus.QUEUED,
-                            "lease expired, reclaimed from lost owner=" + lostOwner);
-                    readyQueue.add(job);
+                    if (job.getAttempt() >= job.getMaxAttempts()) {
+                        job.setFailureKind(FailureKind.LOST);
+                        job.setFailureMessage("owner lost contact, attempts exhausted");
+                        transition(job, JobStatus.FAILED,
+                                "lease expired, reclaimed from lost owner=" + lostOwner
+                                        + ", attempts exhausted attempt=" + job.getAttempt()
+                                        + "/" + job.getMaxAttempts() + " -> terminal LOST");
+                    } else {
+                        Duration backoff = retryBackoff(job.getAttempt());
+                        job.setNextAttemptAt(now.plus(backoff));
+                        transition(job, JobStatus.QUEUED,
+                                "lease expired, reclaimed from lost owner=" + lostOwner
+                                        + ", consumes attempt=" + job.getAttempt()
+                                        + "/" + job.getMaxAttempts()
+                                        + ", backoff=" + backoff + " nextAttemptAt=" + job.getNextAttemptAt());
+                    }
                     reaped++;
                 }
             }
             if (reaped > 0) {
-                log.info("[reap] reaped={} expired lease(s) back to queue", reaped);
+                log.info("[reap] reaped={} expired lease(s)", reaped);
             }
             return reaped;
         } finally {
@@ -248,6 +295,19 @@ public class JobDispatcher {
         lock.lock();
         try {
             return new ArrayList<>(jobs.values());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 按时间顺序查询一条作业从提交到结束的状态流转记录。
+     * 未知作业返回空列表。
+     */
+    public List<JobTransition> history(String jobId) {
+        lock.lock();
+        try {
+            return List.copyOf(histories.getOrDefault(jobId, List.of()));
         } finally {
             lock.unlock();
         }
@@ -293,8 +353,17 @@ public class JobDispatcher {
         JobStatus from = job.getStatus();
         job.setStatus(to);
         bump(job);
-        log.info("[transition] jobId={} key={} {} -> {} version={} reason={}",
-                job.getId(), job.getIdempotencyKey(), from, to, job.getVersion(), rationale);
+        recordTransition(job, from, to, rationale);
+    }
+
+    /** 追加流转记录：仅在持锁状态下调用，因此不丢不重、顺序与状态机一致。 */
+    private void recordTransition(Job job, JobStatus from, JobStatus to, String rationale) {
+        JobTransition entry = new JobTransition(++transitionSequence, job.getId(), from, to,
+                job.getVersion(), Instant.now(clock), rationale);
+        histories.computeIfAbsent(job.getId(), k -> new ArrayList<>()).add(entry);
+        log.info("[transition] jobId={} key={} {} -> {} version={} seq={} reason={}",
+                job.getId(), job.getIdempotencyKey(), from, to, job.getVersion(),
+                entry.sequence(), rationale);
     }
 
     private void bump(Job job) {

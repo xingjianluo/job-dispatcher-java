@@ -8,6 +8,8 @@ public enum FailureKind {
     NON_RETRYABLE,
     /** 可重试失败但重试次数耗尽 */
     RETRIES_EXHAUSTED,
+    /** 执行方反复失联（租约到期被回收），尝试次数耗尽 */
+    LOST,
     /** 被主动取消 */
     CANCELLED
 }
